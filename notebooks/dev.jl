@@ -25,6 +25,538 @@ begin
 	using InteractiveUtils
 end
 
+# ╔═╡ fc514192-6da5-4971-b7f0-2822c25c7624
+begin
+	# src/energies.jl
+	using StaticArrays
+	using Zygote # For gradients
+	
+	# Type aliases for better performance
+	const Point2D = SVector{2, Float64}
+	const Points2D = Vector{Point2D}
+	
+	function constrained_force_fn(R::Matrix{Float64}, energy_fn::Function, mask::Matrix{Float64})
+	    """
+	    Calculates forces with frozen edges.
+	    """
+	    function new_force_fn(R::Matrix{Float64})
+	        # Compute force as negative gradient of energy
+	        forces = -Zygote.gradient(energy_fn, R)[1]
+	        # Apply mask to zero out forces on frozen nodes
+	        forces .*= mask
+	        return forces
+	    end
+	
+	    return new_force_fn
+	end
+	
+	function compute_force_norm(fire_state)
+	    """Compute the norm of the force vector"""
+	    return norm(fire_state.force)
+	end
+	
+	# Convert between standard Matrix and Points2D
+	function matrix_to_points(positions::Matrix{Float64})::Points2D
+	    n = size(positions, 1)
+	    points = Vector{Point2D}(undef, n)
+	    @inbounds for i in 1:n
+	        points[i] = Point2D(positions[i, 1], positions[i, 2])
+	    end
+	    return points
+	end
+	
+	function angle_energy(system, positions::Matrix{Float64})::Float64
+	    """
+	    Calculates the harmonic angle energy for all triplets.
+	    """
+	    # Convert to Points2D for better performance
+	    points = matrix_to_points(positions)
+	    return angle_energy_points(system, points)
+	end
+	
+	function angle_energy_points(system, points::Points2D)::Float64
+	    """
+	    Version of angle_energy that works directly with Points2D.
+	    """
+	    total_energy = 0.0
+	    
+	    @inbounds for i in 1:size(system.angle_triplets, 1)
+	        triplet = view(system.angle_triplets, i, :)
+	        pi = points[triplet[1]]
+	        pj = points[triplet[2]]
+	        pk = points[triplet[3]]
+	        
+	        # Calculate current angle - optimized version
+	        v1 = pi - pj
+	        v2 = pk - pj
+	        
+	        # Fast normalized dot product
+	        n1 = sqrt(v1[1]^2 + v1[2]^2)
+	        n2 = sqrt(v2[1]^2 + v2[2]^2)
+	        dot_prod = v1[1]*v2[1] + v1[2]*v2[2]
+	        
+	        cos_angle = dot_prod / (n1 * n2)
+	        # Clamp to avoid numerical issues
+	        cos_angle = clamp(cos_angle, -1.0, 1.0)
+	        current_angle = acos(cos_angle)
+	        
+	        # Get equilibrium angle
+	        eq_angle = system.initial_angles[i]
+	        
+	        # Calculate harmonic energy
+	        k_angle = system.k_angles[i]
+	        energy = 0.5 * k_angle * (current_angle - eq_angle)^2
+	        
+	        # Add crossing penalty if needed
+	        if current_angle < system.crossing_penalty_threshold
+	            energy += bond_crossing_penalty(system, current_angle)
+	        end
+	        
+	        total_energy += energy
+	    end
+	    
+	    return total_energy
+	end
+	
+	function bond_crossing_penalty(system, angle::Float64)::Float64
+	    """
+	    Calculate penalty for small angles (potential bond crossings)
+	    """
+	    da = angle / system.crossing_penalty_threshold
+	    
+	    if da < 1.0
+	        # Apply soft sphere like potential
+	        soft_potential = system.crossing_penalty_strength / 2 * (1.0 - da)^2 + 1e-3
+	        
+	        # Apply sigmoid to smooth transition
+	        sigmoid = 1.0 / (1.0 + exp(50.0 * (da - 1.0)))
+	        
+	        return soft_potential * sigmoid
+	    else
+	        return 0.0
+	    end
+	end
+	
+	function bond_energy(system, positions::Matrix{Float64})::Float64
+	    """
+	    Calculate spring energy between connected nodes
+	    """
+	    # Convert to Points2D for better performance
+	    points = matrix_to_points(positions)
+	    return bond_energy_points(system, points)
+	end
+	
+	function bond_energy_points(system, points::Points2D)::Float64
+	    """
+	    Version of bond_energy that works directly with Points2D.
+	    """
+	    total_energy = 0.0
+	    
+	    @inbounds for i in 1:size(system.E, 1)
+	        n1, n2 = system.E[i, :]
+	        r1 = points[n1]
+	        r2 = points[n2]
+	        
+	        # Fast distance calculation
+	        dx = r1[1] - r2[1]
+	        dy = r1[2] - r2[2]
+	        dist = sqrt(dx*dx + dy*dy)
+	        
+	        # Equilibrium distance
+	        eq_dist = system.distances[i]
+	        
+	        # Spring constant
+	        k = system.spring_constants[i]
+	        
+	        # Harmonic energy
+	        energy = 0.5 * k * (dist - eq_dist)^2
+	        
+	        total_energy += energy
+	    end
+	    
+	    return total_energy
+	end
+	
+	function soft_sphere_energy(system, positions::Matrix{Float64})::Float64
+	    """
+	    Calculate soft sphere repulsion between nodes
+	    """
+	    # Convert to Points2D for better performance
+	    points = matrix_to_points(positions)
+	    return soft_sphere_energy_points(system, points)
+	end
+	
+	function soft_sphere_energy_points(system, points::Points2D)::Float64
+	    """
+	    Version of soft_sphere_energy that works directly with Points2D.
+	    """
+	    total_energy = 0.0
+	    sigma = system.soft_sphere_sigma
+	    epsilon = system.soft_sphere_epsilon
+	    sigma_sq = sigma^2
+	    
+	    @inbounds for i in 1:system.N-1
+	        for j in (i+1):system.N
+	            r_i = points[i]
+	            r_j = points[j]
+	            
+	            # Fast squared distance calculation
+	            dx = r_i[1] - r_j[1]
+	            dy = r_i[2] - r_j[2]
+	            r_sq = dx*dx + dy*dy
+	            
+	            # Apply soft sphere potential if nodes are closer than sigma
+	            if r_sq < sigma_sq
+	                r = sqrt(r_sq)
+	                ratio = sigma/r
+	                ratio6 = ratio^6
+	                energy = epsilon * (ratio6^2 - 2*ratio6 + 1)
+	                total_energy += energy
+	            end
+	        end
+	    end
+	    
+	    return total_energy
+	end
+	
+	function total_energy(system, positions::Matrix{Float64})::Float64
+	    """
+	    Calculate the total energy of the system
+	    """
+	    # Convert to Points2D for better performance
+	    points = matrix_to_points(positions)
+	    
+	    # Sum all energy components
+	    energy = bond_energy_points(system, points) + 
+	             angle_energy_points(system, points) +
+	             soft_sphere_energy_points(system, points)
+	             
+	    return energy
+	end
+	
+	function penalty_energy(system, positions::Matrix{Float64})::Float64
+	    """
+	    Calculate penalty energies only (for minimization)
+	    """
+	    # Convert to Points2D for better performance
+	    points = matrix_to_points(positions)
+	    
+	    # Calculate crossing penalty
+	    crossing_penalty = 0.0
+	    @inbounds for i in 1:size(system.angle_triplets, 1)
+	        triplet = view(system.angle_triplets, i, :)
+	        pi = points[triplet[1]]
+	        pj = points[triplet[2]]
+	        pk = points[triplet[3]]
+	        
+	        # Fast angle calculation
+	        v1 = pi - pj
+	        v2 = pk - pj
+	        n1 = sqrt(v1[1]^2 + v1[2]^2)
+	        n2 = sqrt(v2[1]^2 + v2[2]^2)
+	        dot_prod = v1[1]*v2[1] + v1[2]*v2[2]
+	        
+	        cos_angle = dot_prod / (n1 * n2)
+	        cos_angle = clamp(cos_angle, -1.0, 1.0)
+	        angle = acos(cos_angle)
+	        
+	        if angle < system.crossing_penalty_threshold
+	            crossing_penalty += bond_crossing_penalty(system, angle)
+	        end
+	    end
+	    
+	    # Calculate soft sphere repulsion
+	    node_energy = soft_sphere_energy_points(system, points)
+	    
+	    # Return normalized penalty
+	    return (crossing_penalty + node_energy) / system.N
+	end
+end
+
+# ╔═╡ 6b4a5dfe-ca91-49eb-83f1-c6344bde0e8c
+begin
+	# src/simulation.jl
+	using Optim
+	using BenchmarkTools
+	using Profile
+	using ProfileView
+	using Base.Threads
+	
+	# Cache for reusing allocated arrays
+	mutable struct SimulationCache
+	    free_masks::Dict{Vector{Int}, BitVector}
+	    position_buffers::Vector{Matrix{Float64}}
+	    param_buffers::Vector{Vector{Float64}}
+	    
+	    function SimulationCache()
+	        return new(Dict{Vector{Int}, BitVector}(), 
+	                  Vector{Matrix{Float64}}(), 
+	                  Vector{Vector{Float64}}())
+	    end
+	end
+	
+	const SIM_CACHE = SimulationCache()
+	
+	function get_free_mask(cache::SimulationCache, n::Int, fixed_nodes::Vector{Int})::BitVector
+	    key = sort(fixed_nodes)
+	    
+	    if haskey(cache.free_masks, key)
+	        return cache.free_masks[key]
+	    else
+	        mask = ones(Bool, n)
+	        mask[fixed_nodes] .= false
+	        cache.free_masks[key] = mask
+	        return mask
+	    end
+	end
+	
+	function get_position_buffer(cache::SimulationCache, n::Int)::Matrix{Float64}
+	    for (i, buf) in enumerate(cache.position_buffers)
+	        if size(buf, 1) == n
+	            # Remove from cache and return
+	            deleteat!(cache.position_buffers, i)
+	            return buf
+	        end
+	    end
+	    
+	    # Create new buffer
+	    return zeros(Float64, n, 2)
+	end
+	
+	function release_position_buffer!(cache::SimulationCache, buf::Matrix{Float64})
+	    push!(cache.position_buffers, buf)
+	end
+	
+	function get_param_buffer(cache::SimulationCache, n::Int)::Vector{Float64}
+	    for (i, buf) in enumerate(cache.param_buffers)
+	        if length(buf) == n
+	            # Remove from cache and return
+	            deleteat!(cache.param_buffers, i)
+	            return buf
+	        end
+	    end
+	    
+	    # Create new buffer
+	    return zeros(Float64, n)
+	end
+	
+	function release_param_buffer!(cache::SimulationCache, buf::Vector{Float64})
+	    push!(cache.param_buffers, buf)
+	end
+	
+	function extract_free_params!(params::Vector{Float64}, positions::Matrix{Float64}, 
+	                            free_mask::BitVector)
+	    # Clear params
+	    resize!(params, 0)
+	    
+	    # Extract free parameters
+	    @inbounds for i in 1:size(positions, 1)
+	        if free_mask[i]
+	            push!(params, positions[i, 1])
+	            push!(params, positions[i, 2])
+	        end
+	    end
+	    
+	    return params
+	end
+	
+	function update_positions!(positions::Matrix{Float64}, params::Vector{Float64}, 
+	                         free_mask::BitVector)
+	    idx = 1
+	    @inbounds for i in 1:size(positions, 1)
+	        if free_mask[i]
+	            positions[i, 1] = params[idx]
+	            positions[i, 2] = params[idx+1]
+	            idx += 2
+	        end
+	    end
+	    
+	    return positions
+	end
+	
+	function simulate_minimize_penalty(system)
+	    """
+	    Minimizes the penalty energy (prevents overlaps and crossings)
+	    """
+	    # Get initial positions
+	    R_init = copy(system.X)
+	    
+	    # Identify surface nodes (fixed during minimization)
+	    fixed_nodes = Int[]
+	    for values in values(system.surface_nodes)
+	        append!(fixed_nodes, values)
+	    end
+	    unique!(fixed_nodes)
+	    
+	    # Create a mask for non-fixed nodes
+	    free_mask = get_free_mask(SIM_CACHE, system.N, fixed_nodes)
+	    
+	    # Get position buffer for optimization
+	    positions_buffer = get_position_buffer(SIM_CACHE, system.N)
+	    copyto!(positions_buffer, R_init)
+	    
+	    # Get parameter buffer
+	    params_buffer = get_param_buffer(SIM_CACHE, 2*sum(free_mask))
+	    extract_free_params!(params_buffer, R_init, free_mask)
+	    
+	    # Function to calculate energy from flattened positions
+	    function energy_fn(x)
+	        # Update positions
+	        update_positions!(positions_buffer, x, free_mask)
+	        
+	        # Calculate energy
+	        return penalty_energy(system, positions_buffer)
+	    end
+	    
+	    # Optimize
+	    result = optimize(energy_fn, params_buffer, ConjugateGradient(), 
+	                     Optim.Options(iterations=system.steps, 
+	                                  g_tol=1e-5))
+	    
+	    # Reconstruct optimized positions
+	    R_final = copy(R_init)
+	    update_positions!(R_final, Optim.minimizer(result), free_mask)
+	    
+	    # Return buffers to cache
+	    release_position_buffer!(SIM_CACHE, positions_buffer)
+	    release_param_buffer!(SIM_CACHE, params_buffer)
+	    
+	    return R_init, R_final
+	end
+	
+	function simulate_auxetic(system)
+	    """
+	    Simulates the auxetic compression process
+	    """
+	    # Ensure minimized initial configuration
+	    R_init, _ = simulate_minimize_penalty(system)
+	    system.X = R_init
+	    
+	    # Initialize parameters
+	    num_iterations = ceil(Int, abs(system.perturbation / system.delta_perturbation))
+	    
+	    # Get surface nodes
+	    top_indices = system.surface_nodes["top"]
+	    bottom_indices = system.surface_nodes["bottom"]
+	    left_indices = system.surface_nodes["left"]
+	    right_indices = system.surface_nodes["right"]
+	    
+	    # Pre-allocate arrays for position log
+	    position_log = Vector{Matrix{Float64}}(undef, num_iterations + 1)
+	    position_log[1] = copy(R_init)
+	    
+	    # Get position buffer for optimization
+	    R_current = get_position_buffer(SIM_CACHE, system.N)
+	    copyto!(R_current, R_init)
+	    
+	    # Create fixed nodes array once
+	    fixed_nodes = vcat(left_indices, right_indices)
+	    
+	    # Get mask for fixed nodes
+	    free_mask = get_free_mask(SIM_CACHE, system.N, fixed_nodes)
+	    
+	    # Get parameter buffer
+	    num_free_params = 2 * (system.N - length(fixed_nodes))
+	    params_buffer = get_param_buffer(SIM_CACHE, num_free_params)
+	    
+	    # For each compression step
+	    for step in 1:num_iterations
+	        # Apply perturbation to left edge
+	        @inbounds for idx in left_indices
+	            R_current[idx, 1] += system.delta_perturbation
+	        end
+	        
+	        # Extract free parameters
+	        extract_free_params!(params_buffer, R_current, free_mask)
+	        
+	        # Function to calculate total energy from flattened positions
+	        function energy_fn(x)
+	            # Update positions
+	            update_positions!(R_current, x, free_mask)
+	            
+	            # Calculate total energy
+	            return total_energy(system, R_current)
+	        end
+	        
+	        # Optimize
+	        result = optimize(energy_fn, params_buffer, ConjugateGradient(), 
+	                         Optim.Options(iterations=system.steps, 
+	                                      g_tol=1e-5))
+	        
+	        # Update positions with optimized values
+	        update_positions!(R_current, Optim.minimizer(result), free_mask)
+	        
+	        # Store the current positions
+	        position_log[step + 1] = copy(R_current)
+	    end
+	    
+	    # Final positions
+	    R_final = position_log[end]
+	    
+	    # Calculate Poisson's ratio
+	    # Initial dimensions
+	    initial_horizontal = mean(R_init[right_indices[2:end-1], 1]) - mean(R_init[left_indices[2:end-1], 1])
+	    initial_vertical = mean(R_init[top_indices[2:end-1], 2]) - mean(R_init[bottom_indices[2:end-1], 2])
+	    
+	    # Final dimensions
+	    final_horizontal = mean(R_final[right_indices[2:end-1], 1]) - mean(R_final[left_indices[2:end-1], 1])
+	    final_vertical = mean(R_final[top_indices[2:end-1], 2]) - mean(R_final[bottom_indices[2:end-1], 2])
+	    
+	    # Calculate the Poisson ratio
+	    poisson = poisson_ratio(initial_horizontal, initial_vertical, final_horizontal, final_vertical)
+	    
+	    # Return buffers to cache
+	    release_position_buffer!(SIM_CACHE, R_current)
+	    release_param_buffer!(SIM_CACHE, params_buffer)
+	    
+	    return poisson, R_init, R_final, position_log
+	end
+	
+	"""
+	Profiling utilities
+	"""
+	function profile_simulation(system, samples=5)
+	    # Clear any existing profiling data
+	    Profile.clear()
+	    
+	    # Start profiling
+	    @profile begin
+	        for _ in 1:samples
+	            poisson, R_init, R_final, log = simulate_auxetic(system)
+	        end
+	    end
+	    
+	    # Print text summary
+	    Profile.print(format=:flat)
+	    
+	    # Visualize profile (requires ProfileView)
+	    ProfileView.view()
+	end
+	
+	function benchmark_simulation(system)
+	    return @benchmark simulate_auxetic($system)
+	end
+	
+	function benchmark_energy_functions(system)
+	    # Get a sample position matrix
+	    positions = system.X
+	    
+	    # Benchmark each energy function
+	    bond_bench = @benchmark bond_energy($system, $positions)
+	    angle_bench = @benchmark angle_energy($system, $positions)
+	    sphere_bench = @benchmark soft_sphere_energy($system, $positions)
+	    total_bench = @benchmark total_energy($system, $positions)
+	    
+	    # Print results
+	    println("Bond energy:        ", summary(bond_bench))
+	    println("Angle energy:       ", summary(angle_bench))
+	    println("Soft sphere energy: ", summary(sphere_bench))
+	    println("Total energy:       ", summary(total_bench))
+	    
+	    return (bond=bond_bench, angle=angle_bench, sphere=sphere_bench, total=total_bench)
+	end
+end
+
 # ╔═╡ c5c2c26a-4d35-4690-8d9e-9615894d1b61
 begin
     # Include source files directly
@@ -57,391 +589,6 @@ end
 md"""
 ## Energies 
 """
-
-# ╔═╡ fc514192-6da5-4971-b7f0-2822c25c7624
-begin
-	# src/energies.jl
-	
-	function constrained_force_fn(R, energy_fn, mask)
-	    """
-	    Calculates forces with frozen edges.
-	
-	    R: position matrix
-	    energy_fn: energy function
-	    mask: mask for frozen edges (1 for free, 0 for frozen)
-	
-	    Returns: A function that computes the total force with frozen edges
-	    """
-	    function new_force_fn(R)
-	        # Compute force as negative gradient of energy
-	        forces = -gradient(energy_fn, R)
-	        # Apply mask to zero out forces on frozen nodes
-	        forces .*= mask
-	        return forces
-	    end
-	
-	    return new_force_fn
-	end
-	
-	function compute_force_norm(fire_state)
-	    """Compute the norm of the force vector"""
-	    return norm(fire_state.force)
-	end
-	
-	function angle_energy(system, positions)
-	    """
-	    Calculates the harmonic angle energy for all triplets.
-	    
-	    system: System containing angle data
-	    positions: Matrix of node positions
-	    
-	    Returns: Total angle energy
-	    """
-	    total_energy = 0.0
-	    
-	    for i in 1:size(system.angle_triplets, 1)
-	        triplet = system.angle_triplets[i, :]
-	        pi = positions[triplet[1], :]
-	        pj = positions[triplet[2], :]
-	        pk = positions[triplet[3], :]
-	        
-	        # Calculate current angle
-	        current_angle = compute_angle_between_triplet(pi, pj, pk)
-	        
-	        # Get equilibrium angle
-	        eq_angle = system.initial_angles[i]
-	        
-	        # Calculate harmonic energy
-	        k_angle = system.k_angles[i]
-	        energy = 0.5 * k_angle * (current_angle - eq_angle)^2
-	        
-	        # Add crossing penalty if needed
-	        if current_angle < system.crossing_penalty_threshold
-	            energy += bond_crossing_penalty(system, current_angle)
-	        end
-	        
-	        total_energy += energy
-	    end
-	    
-	    return total_energy
-	end
-	
-	function bond_crossing_penalty(system, angle)
-	    """
-	    Calculate penalty for small angles (potential bond crossings)
-	    
-	    system: System containing penalty parameters
-	    angle: Current angle in radians
-	    
-	    Returns: Penalty energy
-	    """
-	    da = angle / system.crossing_penalty_threshold
-	    
-	    if da < 1.0
-	        # Apply soft sphere like potential
-	        soft_potential = system.crossing_penalty_strength / 2 * (1.0 - da)^2 + 1e-3
-	        
-	        # Apply sigmoid to smooth transition
-	        sigmoid = 1.0 / (1.0 + exp(50.0 * (da - 1.0)))
-	        
-	        return soft_potential * sigmoid
-	    else
-	        return 0.0
-	    end
-	end
-	
-	function bond_energy(system, positions)
-	    """
-	    Calculate spring energy between connected nodes
-	    
-	    system: System containing connectivity and spring constants
-	    positions: Matrix of node positions
-	    
-	    Returns: Total bond energy
-	    """
-	    total_energy = 0.0
-	    
-	    for i in 1:size(system.E, 1)
-	        n1, n2 = system.E[i, :]
-	        r1 = positions[n1, :]
-	        r2 = positions[n2, :]
-	        
-	        # Current distance
-	        dist = norm(r1 - r2)
-	        
-	        # Equilibrium distance
-	        eq_dist = system.distances[i]
-	        
-	        # Spring constant
-	        k = system.spring_constants[i]
-	        
-	        # Harmonic energy
-	        energy = 0.5 * k * (dist - eq_dist)^2
-	        
-	        total_energy += energy
-	    end
-	    
-	    return total_energy
-	end
-	
-	function soft_sphere_energy(system, positions)
-	    """
-	    Calculate soft sphere repulsion between nodes
-	    
-	    system: System with soft sphere parameters
-	    positions: Matrix of node positions
-	    
-	    Returns: Total repulsion energy
-	    """
-	    total_energy = 0.0
-	    sigma = system.soft_sphere_sigma
-	    epsilon = system.soft_sphere_epsilon
-	    
-	    # For all pairs of nodes
-	    for i in 1:system.N
-	        for j in (i+1):system.N
-	            r_i = positions[i, :]
-	            r_j = positions[j, :]
-	            
-	            r = norm(r_i - r_j)
-	            
-	            # Apply soft sphere potential if nodes are closer than sigma
-	            if r < sigma
-	                energy = epsilon * ((sigma/r)^12 - 2*(sigma/r)^6 + 1)
-	                total_energy += energy
-	            end
-	        end
-	    end
-	    
-	    return total_energy
-	end
-	
-	function total_energy(system, positions)
-	    """
-	    Calculate the total energy of the system
-	    
-	    system: System containing all parameters
-	    positions: Matrix of node positions
-	    
-	    Returns: Total energy
-	    """
-	    # Sum all energy components
-	    energy = bond_energy(system, positions) + 
-	             angle_energy(system, positions) +
-	             soft_sphere_energy(system, positions)
-	             
-	    return energy
-	end
-	
-	function penalty_energy(system, positions)
-	    """
-	    Calculate penalty energies only (for minimization)
-	    
-	    system: System containing parameters
-	    positions: Matrix of node positions
-	    
-	    Returns: Penalty energy per node
-	    """
-	    # Calculate crossing penalty
-	    crossing_penalty = 0.0
-	    for i in 1:size(system.angle_triplets, 1)
-	        triplet = system.angle_triplets[i, :]
-	        pi = positions[triplet[1], :]
-	        pj = positions[triplet[2], :]
-	        pk = positions[triplet[3], :]
-	        
-	        angle = compute_angle_between_triplet(pi, pj, pk)
-	        
-	        if angle < system.crossing_penalty_threshold
-	            crossing_penalty += bond_crossing_penalty(system, angle)
-	        end
-	    end
-	    
-	    # Calculate soft sphere repulsion
-	    node_energy = soft_sphere_energy(system, positions)
-	    
-	    # Return normalized penalty
-	    return (crossing_penalty + node_energy) / system.N
-	end
-end
-
-# ╔═╡ 6b4a5dfe-ca91-49eb-83f1-c6344bde0e8c
-begin
-	# src/simulation.jl
-	using Optim  # For optimization
-	
-	function simulate_minimize_penalty(system)
-	    """
-	    Minimizes the penalty energy (prevents overlaps and crossings)
-	    
-	    system: System containing state and properties
-	    
-	    Returns: Optimized positions
-	    """
-	    # Get initial positions
-	    R_init = copy(system.X)
-	    
-	    # Identify surface nodes (fixed during minimization)
-	    fixed_nodes = Int[]
-	    for values in values(system.surface_nodes)
-	        append!(fixed_nodes, values)
-	    end
-	    unique!(fixed_nodes)
-	    
-	    # Create a mask for non-fixed nodes
-	    free_mask = ones(Bool, system.N)
-	    free_mask[fixed_nodes] .= false
-	    
-	    # Create flattened representation
-	    x0 = vec(R_init')  # Flatten the array column-major
-	    
-	    # Function to calculate energy from flattened positions
-	    function energy_fn(x)
-	        # Reshape to position matrix, preserving fixed nodes
-	        positions = copy(R_init)
-	        idx = 1
-	        for i in 1:system.N
-	            if free_mask[i]
-	                positions[i, 1] = x[idx]
-	                positions[i, 2] = x[idx+1]
-	                idx += 2
-	            end
-	        end
-	        
-	        # Calculate energy
-	        return penalty_energy(system, positions)
-	    end
-	    
-	    # Extract only free parameters
-	    free_params = Float64[]
-	    for i in 1:system.N
-	        if free_mask[i]
-	            push!(free_params, R_init[i, 1])
-	            push!(free_params, R_init[i, 2])
-	        end
-	    end
-	    
-	    # Optimize
-	    result = optimize(energy_fn, free_params, LBFGS(), 
-	                     Optim.Options(iterations=system.steps))
-	    
-	    # Reconstruct optimized positions
-	    R_final = copy(R_init)
-	    x_opt = Optim.minimizer(result)
-	    idx = 1
-	    for i in 1:system.N
-	        if free_mask[i]
-	            R_final[i, 1] = x_opt[idx]
-	            R_final[i, 2] = x_opt[idx+1]
-	            idx += 2
-	        end
-	    end
-	    
-	    return R_init, R_final
-	end
-	
-	function simulate_auxetic(system)
-	    """
-	    Simulates the auxetic compression process
-	    
-	    system: System containing network properties
-	    
-	    Returns: Poisson ratio, initial and final positions
-	    """
-	    # Ensure minimized initial configuration
-	    R_init, _ = simulate_minimize_penalty(system)
-	    system.X = R_init
-	    
-	    # Initialize parameters
-	    num_iterations = ceil(Int, abs(system.perturbation / system.delta_perturbation))
-	    
-	    # Get surface nodes
-	    top_indices = system.surface_nodes["top"]
-	    bottom_indices = system.surface_nodes["bottom"]
-	    left_indices = system.surface_nodes["left"]
-	    right_indices = system.surface_nodes["right"]
-	    
-	    # Create a list to store positions at each step
-	    position_log = [copy(R_init)]
-	    
-	    # Copy the initial positions
-	    R_current = copy(R_init)
-	    
-	    # For each compression step
-	    for i in 1:num_iterations
-	        # Apply perturbation to left edge
-	        for idx in left_indices
-	            R_current[idx, 1] += system.delta_perturbation
-	        end
-	        
-	        # Create mask for fixed nodes (left and right edges)
-	        fixed_nodes = vcat(left_indices, right_indices)
-	        free_mask = ones(Bool, system.N)
-	        free_mask[fixed_nodes] .= false
-	        
-	        # Minimize energy with fixed left and right edges
-	        free_params = Float64[]
-	        for i in 1:system.N
-	            if free_mask[i]
-	                push!(free_params, R_current[i, 1])
-	                push!(free_params, R_current[i, 2])
-	            end
-	        end
-	        
-	        # Function to calculate total energy from flattened positions
-	        function energy_fn(x)
-	            # Reshape to position matrix, preserving fixed nodes
-	            positions = copy(R_current)
-	            idx = 1
-	            for i in 1:system.N
-	                if free_mask[i]
-	                    positions[i, 1] = x[idx]
-	                    positions[i, 2] = x[idx+1]
-	                    idx += 2
-	                end
-	            end
-	            
-	            # Calculate total energy
-	            return total_energy(system, positions)
-	        end
-	        
-	        # Optimize
-	        result = optimize(energy_fn, free_params, LBFGS(), 
-	                         Optim.Options(iterations=system.steps))
-	        
-	        # Reconstruct optimized positions
-	        x_opt = Optim.minimizer(result)
-	        idx = 1
-	        for i in 1:system.N
-	            if free_mask[i]
-	                R_current[i, 1] = x_opt[idx]
-	                R_current[i, 2] = x_opt[idx+1]
-	                idx += 2
-	            end
-	        end
-	        
-	        # Store the current positions
-	        push!(position_log, copy(R_current))
-	    end
-	    
-	    # Final positions
-	    R_final = position_log[end]
-	    
-	    # Calculate Poisson's ratio
-	    # Initial dimensions
-	    initial_horizontal = mean(R_init[right_indices[2:end-1], 1]) - mean(R_init[left_indices[2:end-1], 1])
-	    initial_vertical = mean(R_init[top_indices[2:end-1], 2]) - mean(R_init[bottom_indices[2:end-1], 2])
-	    
-	    # Final dimensions
-	    final_horizontal = mean(R_final[right_indices[2:end-1], 1]) - mean(R_final[left_indices[2:end-1], 1])
-	    final_vertical = mean(R_final[top_indices[2:end-1], 2]) - mean(R_final[bottom_indices[2:end-1], 2])
-	    
-	    # Calculate the Poisson ratio
-	    poisson = poisson_ratio(initial_horizontal, initial_vertical, final_horizontal, final_vertical)
-	    
-	    return poisson, R_init, R_final, position_log
-	end
-end
 
 # ╔═╡ 40db0e36-18df-4ce8-9547-d5eeaf985813
 md"""
@@ -679,7 +826,7 @@ begin
     system.frequency_center = 2.0
     system.frequency_width = 0.2
     system.perturbation = 1.0
-    system.delta_perturbation = 0.5
+    system.delta_perturbation = 0.2
     system.steps = 50
     
     # Run compression
