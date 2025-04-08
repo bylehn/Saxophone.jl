@@ -1,9 +1,4 @@
-using Plots
 function visualize_network(system::System)
-    
-    # Extract node positions
-    X = system.X
-    
     # Create plot with appropriate dimensions
     p = plot(
         aspect_ratio=:equal,
@@ -12,6 +7,9 @@ function visualize_network(system::System)
         legend=false,
         grid=false
     )
+    
+    # Extract node positions
+    X = system.X
     
     # Plot edges
     for i in 1:size(system.E, 1)

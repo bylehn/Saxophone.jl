@@ -1,22 +1,21 @@
 module Saxophone
-
+const VERSION_INDICATOR = "v0.1.2" # Change this when testing reloading
+# Import packages used by the module
 using LinearAlgebra
 using SparseArrays
 using Graphs
-using GeometryBasics
 using DelaunayTriangulation
 using Statistics
+using Random
+using Plots
 
-# We'll organize by submodules
-include("types.jl")        # Core data types
-include("utils.jl")        # Utility functions
-include("energies.jl")     # Energy calculations
-include("simulation.jl")   # Simulation functions 
-include("visualization.jl") # Visualization tools
+# Include files with implementations
+include("types.jl")
+include("utils.jl")
+include("visualization.jl")
 
-# Exports
-export System, initialize!, create_delaunay_graph!
-export compute_angle_between_triplet, calculate_angle_triplets
-export calculate_initial_angles, poisson_ratio
+# Export public interface
+export System, initialize!
+export visualize_network
 
-end # module
+end # module Saxophone
